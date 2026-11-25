@@ -538,7 +538,7 @@ class Lc0exCudaBackend final : public Backend {
     const int concurrency =
         std::max(1, backend_options.GetOrDefault<int>("concurrency", 1));
     execution_slot_pool_.in_use.assign(concurrency, false);
-    executions_.resize(concurrency);
+    executions_ = decltype(executions_)(concurrency);
 
     const std::string lc0ex_path = backend_options.Get<std::string>("lc0ex");
     if (lc0ex_path.empty()) {
