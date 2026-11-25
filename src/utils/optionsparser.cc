@@ -1,6 +1,6 @@
 /*
   This file is part of Leela Chess Zero.
-  Copyright (C) 2018 The LCZero Authors
+  Copyright (C) 2018-2019 The LCZero Authors
 
   Leela Chess is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -27,9 +27,11 @@
 
 #include "optionsparser.h"
 
+#include <charconv>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+
 #include "utils/commandline.h"
 #include "utils/configfile.h"
 #include "utils/logging.h"
@@ -49,7 +51,8 @@ OptionsParser::OptionsParser() : values_(*defaults_.AddSubdict("values")) {}
 std::vector<std::string> OptionsParser::ListOptionsUci() const {
   std::vector<std::string> result;
   for (const auto& iter : options_) {
-    if (!iter->GetUciOption().empty() && !iter->hidden_) {
+    if (!iter->GetUciOption().empty() &&
+        (iter->GetId().visibility_mask() & visibility_mode_)) {
       result.emplace_back("option name " + iter->GetUciOption() + " " +
                           iter->GetOptionString(values_));
     }
@@ -66,11 +69,6 @@ void OptionsParser::SetUciOption(const std::string& name,
     return;
   }
   throw Exception("Unknown option: " + name);
-}
-
-void OptionsParser::HideOption(const OptionId& id) {
-  auto option = FindOptionById(id.GetId());
-  if (option) option->hidden_ = true;
 }
 
 OptionsParser::Option* OptionsParser::FindOptionByLongFlag(
@@ -90,22 +88,29 @@ OptionsParser::Option* OptionsParser::FindOptionByUciName(
   return nullptr;
 }
 
-OptionsParser::Option* OptionsParser::FindOptionById(
-    const std::string& name) const {
+OptionsParser::Option* OptionsParser::FindOptionById(const OptionId& id) const {
   for (const auto& val : options_) {
-    if (name == val->GetId()) return val.get();
+    if (id == val->GetId()) return val.get();
   }
   return nullptr;
 }
 
 OptionsDict* OptionsParser::GetMutableOptions(const std::string& context) {
   if (context == "") return &values_;
-  return values_.GetMutableSubdict(context);
+  auto* result = &values_;
+  for (const auto& x : StrSplit(context, ".")) {
+    result = result->GetMutableSubdict(x);
+  }
+  return result;
 }
 
 const OptionsDict& OptionsParser::GetOptionsDict(const std::string& context) {
   if (context == "") return values_;
-  return values_.GetSubdict(context);
+  const auto* result = &values_;
+  for (const auto& x : StrSplit(context, ".")) {
+    result = &result->GetSubdict(x);
+  }
+  return *result;
 }
 
 bool OptionsParser::ProcessAllFlags() {
@@ -114,14 +119,21 @@ bool OptionsParser::ProcessAllFlags() {
 }
 
 bool OptionsParser::ProcessFlags(const std::vector<std::string>& args) {
+  auto show_help = false;
+  if (CommandLine::BinaryName().find("simple") != std::string::npos) {
+    visibility_mode_ = OptionId::kSimpleMode;
+  } else if (CommandLine::BinaryName().find("pro") != std::string::npos) {
+    visibility_mode_ = OptionId::kProMode;
+  }
   for (auto iter = args.begin(), end = args.end(); iter != end; ++iter) {
     std::string param = *iter;
-    if (param == "-h" || param == "--help") {
-      ShowHelp();
-      return false;
-    }
     if (param == "--show-hidden") {
-      ShowHidden();
+      visibility_mode_ = OptionId::kProMode;
+      continue;
+    }
+    if (param == "-h" || param == "--help") {
+      // Set a flag so that --show-hidden after --help works.
+      show_help = true;
       continue;
     }
 
@@ -134,7 +146,7 @@ bool OptionsParser::ProcessFlags(const std::vector<std::string>& args) {
         value = param.substr(pos + 1);
         param = param.substr(0, pos);
       }
-      pos = param.find('.');
+      pos = param.rfind('.');
       if (pos != std::string::npos) {
         context = param.substr(0, pos);
         param = param.substr(pos + 1);
@@ -179,6 +191,10 @@ bool OptionsParser::ProcessFlags(const std::vector<std::string>& args) {
 
     CERR << "Unknown command line argument: " << *iter << ".\n";
     CERR << "For help run:\n  " << CommandLine::BinaryName() << " --help";
+    return false;
+  }
+  if (show_help) {
+    ShowHelp();
     return false;
   }
   return true;
@@ -251,8 +267,12 @@ void OptionsParser::ShowHelp() const {
 
   std::cout << "\nAllowed command line flags for current mode:\n";
   std::cout << FormatFlag('h', "help", "Show help and exit.");
+  std::cout << FormatFlag('\0', "show-hidden",
+                          "Show hidden options. Use with --help.");
   for (const auto& option : options_) {
-    if (!option->hidden_) std::cout << option->GetHelp(defaults_);
+    if ((option->GetId().visibility_mask() & visibility_mode_)) {
+      std::cout << option->GetHelp(values_);
+    }
   }
 
   auto contexts = values_.ListSubdicts();
@@ -262,10 +282,6 @@ void OptionsParser::ShowHelp() const {
     std::cout << "       --" << contexts[0] << '.'
               << options_.back()->GetLongFlag() << "=(value)\n";
   }
-}
-
-void OptionsParser::ShowHidden() const {
-  for (const auto& option : options_) option->hidden_ = false;
 }
 
 /////////////////////////////////////////////////////////////////
@@ -299,8 +315,12 @@ bool StringOption::ProcessShortFlagWithValue(char flag,
 }
 
 std::string StringOption::GetHelp(const OptionsDict& dict) const {
-  return FormatFlag(GetShortFlag(), GetLongFlag() + "=STRING", GetHelpText(),
-                    GetUciOption(), GetVal(dict));
+  std::string long_flag = GetLongFlag();
+  if (!long_flag.empty()) {
+    long_flag += "=STRING";
+  }
+  return FormatFlag(GetShortFlag(), long_flag, GetHelpText(), GetUciOption(),
+                    GetVal(dict));
 }
 
 std::string StringOption::GetOptionString(const OptionsDict& dict) const {
@@ -323,13 +343,13 @@ IntOption::IntOption(const OptionId& id, int min, int max)
     : Option(id), min_(min), max_(max) {}
 
 void IntOption::SetValue(const std::string& value, OptionsDict* dict) {
-  SetVal(dict, std::stoi(value));
+  SetVal(dict, ValidateIntString(value));
 }
 
 bool IntOption::ProcessLongFlag(const std::string& flag,
                                 const std::string& value, OptionsDict* dict) {
   if (flag == GetLongFlag()) {
-    SetVal(dict, std::stoi(value));
+    SetVal(dict, ValidateIntString(value));
     return true;
   }
   return false;
@@ -338,7 +358,7 @@ bool IntOption::ProcessLongFlag(const std::string& flag,
 bool IntOption::ProcessShortFlagWithValue(char flag, const std::string& value,
                                           OptionsDict* dict) {
   if (flag == GetShortFlag()) {
-    SetVal(dict, std::stoi(value));
+    SetVal(dict, ValidateIntString(value));
     return true;
   }
   return false;
@@ -374,6 +394,21 @@ void IntOption::SetVal(OptionsDict* dict, const ValueType& val) const {
   dict->Set<ValueType>(GetId(), val);
 }
 
+int IntOption::ValidateIntString(const std::string& val) const {
+  int result;
+  const auto end = val.data() + val.size();
+  auto [ptr, err] = std::from_chars(val.data(), end, result);
+  if (err == std::errc::invalid_argument) {
+    throw Exception("Flag '--" + GetLongFlag() + "' has an invalid format.");
+  } else if (err == std::errc::result_out_of_range) {
+    throw Exception("Flag '--" + GetLongFlag() + "' is out of range.");
+  } else if (ptr != end) {
+    throw Exception("Flag '--" + GetLongFlag() + "' has trailing characters.");
+  } else {
+    return result;
+  }
+}
+
 /////////////////////////////////////////////////////////////////
 // FloatOption
 /////////////////////////////////////////////////////////////////
@@ -382,13 +417,25 @@ FloatOption::FloatOption(const OptionId& id, float min, float max)
     : Option(id), min_(min), max_(max) {}
 
 void FloatOption::SetValue(const std::string& value, OptionsDict* dict) {
-  SetVal(dict, std::stof(value));
+  try {
+    SetVal(dict, std::stof(value));
+  } catch (std::invalid_argument&) {
+    throw Exception("invalid value " + value);
+  } catch (const std::out_of_range&) {
+    throw Exception("out of range value " + value);
+  }
 }
 
 bool FloatOption::ProcessLongFlag(const std::string& flag,
                                   const std::string& value, OptionsDict* dict) {
   if (flag == GetLongFlag()) {
-    SetVal(dict, std::stof(value));
+    try {
+      SetVal(dict, std::stof(value));
+    } catch (std::invalid_argument&) {
+      throw Exception("invalid value " + value);
+    } catch (const std::out_of_range&) {
+      throw Exception("out of range value " + value);
+    }
     return true;
   }
   return false;
@@ -397,7 +444,13 @@ bool FloatOption::ProcessLongFlag(const std::string& flag,
 bool FloatOption::ProcessShortFlagWithValue(char flag, const std::string& value,
                                             OptionsDict* dict) {
   if (flag == GetShortFlag()) {
-    SetVal(dict, std::stof(value));
+    try {
+      SetVal(dict, std::stof(value));
+    } catch (std::invalid_argument&) {
+      throw Exception("invalid value " + value);
+    } catch (const std::out_of_range&) {
+      throw Exception("out of range value " + value);
+    }
     return true;
   }
   return false;
@@ -502,6 +555,34 @@ void BoolOption::ValidateBoolString(const std::string& val) {
         << "'true' or 'false'.";
     throw Exception(buf.str());
   }
+}
+
+/////////////////////////////////////////////////////////////////
+// ButtonOption
+/////////////////////////////////////////////////////////////////
+
+ButtonOption::ButtonOption(const OptionId& id) : Option(id) {}
+
+void ButtonOption::SetValue(const std::string& /*value*/, OptionsDict* dict) {
+  dict->Set<ValueType>(GetId(), true);
+}
+
+bool ButtonOption::ProcessLongFlag(const std::string& /*flag*/,
+                                   const std::string& /*value*/,
+                                   OptionsDict* /*dict*/) {
+  return false;
+}
+
+bool ButtonOption::ProcessShortFlag(char /*flag*/, OptionsDict* /*dict*/) {
+  return false;
+}
+
+std::string ButtonOption::GetHelp(const OptionsDict& /*dict*/) const {
+  return "";
+}
+
+std::string ButtonOption::GetOptionString(const OptionsDict& /*dict*/) const {
+  return "type button";
 }
 
 /////////////////////////////////////////////////////////////////

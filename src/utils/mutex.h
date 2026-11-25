@@ -30,7 +30,23 @@
 #include <atomic>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
+
+#if defined(__x86_64__)
+#include <emmintrin.h>
+#endif
+
 #include "utils/cppattributes.h"
+#include "utils/spinhelper.h"
+
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+
+#if __has_feature(thread_sanitizer) || defined(__SANITIZE_THREAD__)
+#define TSAN_BUILD 1
+#include <sanitizer/tsan_interface.h>
+#endif
 
 namespace lczero {
 
@@ -71,6 +87,10 @@ class CAPABILITY("mutex") Mutex {
     Lock(Mutex& m) ACQUIRE(m) : lock_(m.get_raw()) {}
     ~Lock() RELEASE() {}
     std::unique_lock<std::mutex>& get_raw() { return lock_; }
+
+    void lock() ACQUIRE() { lock_.lock(); }
+    void unlock() RELEASE() { lock_.unlock(); }
+    bool owns_lock() const { return lock_.owns_lock(); }
 
    private:
     std::unique_lock<std::mutex> lock_;
@@ -116,6 +136,112 @@ class CAPABILITY("mutex") SharedMutex {
 
  private:
   std::shared_timed_mutex mutex_;
+};
+
+// A very simple spin lock.
+class CAPABILITY("mutex") SpinMutex {
+ public:
+  // std::unique_lock<SpinMutex> wrapper.
+  class SCOPED_CAPABILITY Lock {
+   public:
+    Lock(SpinMutex& m) ACQUIRE(m) : lock_(m) {}
+    ~Lock() RELEASE() {}
+
+    void unlock() RELEASE() { lock_.unlock(); }
+    void lock() ACQUIRE() { lock_.lock(); }
+
+    bool owns_lock() const { return lock_.owns_lock(); }
+
+   private:
+    std::unique_lock<SpinMutex> lock_;
+  };
+
+#if TSAN_BUILD
+  SpinMutex() { __tsan_mutex_create(&mutex_, 0); }
+#endif
+#if TSAN_BUILD
+  ~SpinMutex() { __tsan_mutex_destroy(&mutex_, 0); }
+#endif
+
+#if defined(__clang__) || defined(__GNUC__)
+  [[gnu::always_inline]]
+#elif defined(_MSC_VER)
+  __forceinline
+#endif
+  void lock() ACQUIRE() {
+#if TSAN_BUILD
+    __tsan_mutex_pre_lock(&mutex_, 0);
+#endif
+    int val = 0;
+    if (mutex_.compare_exchange_strong(val, 1, std::memory_order_acquire))
+        [[likely]] {
+#if TSAN_BUILD
+      __tsan_mutex_post_lock(&mutex_, 0, 0);
+#endif
+      return;
+    }
+    SpinMutexSlowLock();
+  }
+
+ private:
+  void SpinMutexSlowLock() {
+
+    static constexpr size_t kExpectedSpinTimeNs = 400;
+    MonitorHelper monitor(mutex_, kExpectedSpinTimeNs);
+
+    while (true) {
+      monitor([](int value) { return value != 0; });
+      int val = 0;
+      if (mutex_.compare_exchange_weak(val, 1, std::memory_order_acquire)) {
+#if TSAN_BUILD
+        __tsan_mutex_post_lock(&mutex_, 0, 0);
+#endif
+        break;
+      }
+    }
+  }
+
+ public:
+#if defined(__clang__) || defined(__GNUC__)
+  [[gnu::always_inline]]
+#elif defined(_MSC_VER)
+  __forceinline
+#endif
+  bool try_lock() TRY_ACQUIRE(true) {
+#if TSAN_BUILD
+    __tsan_mutex_pre_lock(&mutex_, __tsan_mutex_try_lock);
+#endif
+    int val = 0;
+    if (mutex_.compare_exchange_strong(val, 1, std::memory_order_acquire))
+        [[likely]] {
+#if TSAN_BUILD
+      __tsan_mutex_post_lock(&mutex_, __tsan_mutex_try_lock, 0);
+#endif
+      return true;
+    }
+#if TSAN_BUILD
+    __tsan_mutex_post_lock(&mutex_, __tsan_mutex_try_lock_failed, 0);
+#endif
+    return false;
+  }
+
+#if defined(__clang__) || defined(__GNUC__)
+  [[gnu::always_inline]]
+#elif defined(_MSC_VER)
+  __forceinline
+#endif
+  void unlock() RELEASE() {
+#if TSAN_BUILD
+    __tsan_mutex_pre_unlock(&mutex_, 0);
+#endif
+    mutex_.store(0, std::memory_order_release);
+#if TSAN_BUILD
+    __tsan_mutex_post_unlock(&mutex_, 0);
+#endif
+  }
+
+ private:
+  std::atomic<int> mutex_{0};
 };
 
 }  // namespace lczero

@@ -26,6 +26,12 @@
 */
 
 #include "utils/logging.h"
+
+#include <version>
+#if __cpp_lib_format >= 201907L
+#include <chrono>
+#include <format>
+#endif
 #include <iomanip>
 #include <iostream>
 #include <thread>
@@ -33,8 +39,8 @@
 namespace lczero {
 
 namespace {
-size_t kBufferSizeLines = 200;
-const char* kStderrFilename = "<stderr>";
+const size_t kBufferSizeLines = 200;
+const char* const kStderrFilename = "<stderr>";
 }  // namespace
 
 Logging& Logging::Get() {
@@ -84,6 +90,14 @@ StderrLogMessage::~StderrLogMessage() {
   log_ << str();
 }
 
+StdoutLogMessage::StdoutLogMessage(const char* file, int line)
+    : log_(file, line) {}
+
+StdoutLogMessage::~StdoutLogMessage() {
+  std::cout << str() << std::endl;
+  log_ << str();
+}
+
 std::chrono::time_point<std::chrono::system_clock> SteadyClockToSystemClock(
     std::chrono::time_point<std::chrono::steady_clock> time) {
   return std::chrono::system_clock::now() +
@@ -91,16 +105,46 @@ std::chrono::time_point<std::chrono::system_clock> SteadyClockToSystemClock(
              time - std::chrono::steady_clock::now());
 }
 
+namespace {
+#if __cpp_lib_format >= 201907L
+const std::chrono::time_zone* GetCurrentTimeZone() {
+  try {
+    return std::chrono::current_zone();
+  } catch (const std::runtime_error&) {
+    // If the current time zone cannot be determined, fall back to UTC.
+    return nullptr;
+  }
+}
+#endif
+}  // namespace
+
 std::string FormatTime(
     std::chrono::time_point<std::chrono::system_clock> time) {
+#if __cpp_lib_format >= 201907L
+  static auto* zone = GetCurrentTimeZone();
+  return zone ? std::format("{0:%m%d %T}", zone->to_local(time))
+              : std::format("{0:%m%d %T}", time);
+#else
+  static Mutex mutex;
+
   std::ostringstream ss;
-  using namespace std::chrono;
-  auto us =
+  using std::chrono::duration_cast;
+  using std::chrono::microseconds;
+  const auto us =
       duration_cast<microseconds>(time.time_since_epoch()).count() % 1000000;
   auto timer = std::chrono::system_clock::to_time_t(time);
-  ss << std::put_time(std::localtime(&timer), "%m%d %T") << '.'
-     << std::setfill('0') << std::setw(6) << us;
+  // std::localtime is not thread safe. Since this is the only place
+  // std::localtime is used in the program, guard by mutex.
+  // TODO: replace with std::localtime_r or s once they are properly
+  // standardised. Or some other more c++ like time component thing, whichever
+  // comes first...
+  {
+    Mutex::Lock lock(mutex);
+    ss << std::put_time(std::localtime(&timer), "%m%d %T") << '.'
+       << std::setfill('0') << std::setw(6) << us;
+  }
   return ss.str();
+#endif
 }
 
 }  // namespace lczero

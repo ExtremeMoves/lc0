@@ -1,6 +1,6 @@
 /*
   This file is part of Leela Chess Zero.
-  Copyright (C) 2018 The LCZero Authors
+  Copyright (C) 2018-2020 The LCZero Authors
 
   Leela Chess is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -31,33 +31,11 @@
 #include <memory>
 #include <string>
 #include <vector>
+
 #include "utils/exception.h"
 #include "utils/optionsdict.h"
 
 namespace lczero {
-
-struct OptionId {
-  OptionId(const char* long_flag = "", const char* uci_option = "",
-           const char* help_text = "", const char short_flag = '\0')
-      : long_flag(long_flag),
-        uci_option(uci_option),
-        help_text(help_text),
-        short_flag(short_flag) {}
-
-  OptionId(const OptionId& other) = delete;
-
-  const char* const long_flag;
-  const char* const uci_option;
-  const char* const help_text;
-  const char short_flag;
-
-  // Returns Option's own address as string.
-  // TODO(crem) Generalize OptionsDict to have a version which has OptionId*
-  //            as keys instead of std::string.
-  std::string GetId() const {
-    return std::to_string(reinterpret_cast<intptr_t>(this));
-  }
-};
 
 class OptionsParser {
  public:
@@ -66,16 +44,20 @@ class OptionsParser {
   class Option {
    public:
     Option(const OptionId& id);
-    virtual ~Option(){};
+    virtual ~Option() {};
     // Set value from string.
     virtual void SetValue(const std::string& value, OptionsDict* dict) = 0;
 
    protected:
-    std::string GetId() const { return id_.GetId(); }
-    std::string GetUciOption() const { return id_.uci_option; }
-    std::string GetHelpText() const { return id_.help_text; }
-    std::string GetLongFlag() const { return id_.long_flag; }
-    char GetShortFlag() const { return id_.short_flag; }
+    const OptionId& GetId() const { return id_; }
+    std::string GetUciOption() const {
+      return id_.uci_option() ? id_.uci_option() : "";
+    }
+    std::string GetHelpText() const { return id_.help_text(); }
+    std::string GetLongFlag() const {
+      return id_.long_flag() ? id_.long_flag() : "";
+    }
+    char GetShortFlag() const { return id_.short_flag(); }
 
    private:
     virtual std::string GetOptionString(const OptionsDict& dict) const = 0;
@@ -95,7 +77,6 @@ class OptionsParser {
     virtual std::string GetHelp(const OptionsDict& dict) const = 0;
 
     const OptionId& id_;
-    bool hidden_ = false;
     friend class OptionsParser;
   };
 
@@ -117,8 +98,6 @@ class OptionsParser {
   // Set the UCI option from string value.
   void SetUciOption(const std::string& name, const std::string& value,
                     const std::string& context = "");
-  // Hide this option from help and UCI.
-  void HideOption(const OptionId& id);
   // Processes all flags from the command line and an optional
   // configuration file. Returns false if there is an invalid flag.
   bool ProcessAllFlags();
@@ -133,22 +112,21 @@ class OptionsParser {
   OptionsDict* GetMutableDefaultsOptions() { return &defaults_; }
   // Adds a subdictionary for a given context.
   void AddContext(const std::string&);
+  // Prints help to std::cout.
+  void ShowHelp() const;
 
  private:
-  // Prints help to std::cerr.
-  void ShowHelp() const;
-  // Make all hidden options visible.
-  void ShowHidden() const;
   // Returns an option based on the long flag.
   Option* FindOptionByLongFlag(const std::string& flag) const;
   // Returns an option based by its uci name.
   Option* FindOptionByUciName(const std::string& name) const;
   // Returns an option based by its id.
-  Option* FindOptionById(const std::string& name) const;
+  Option* FindOptionById(const OptionId& id) const;
 
   std::vector<std::unique_ptr<Option>> options_;
   OptionsDict defaults_;
   OptionsDict& values_;
+  OptionId::VisibilityMode visibility_mode_ = OptionId::kNormalMode;
 };
 
 class StringOption : public OptionsParser::Option {
@@ -187,6 +165,7 @@ class IntOption : public OptionsParser::Option {
 
   ValueType GetVal(const OptionsDict&) const;
   void SetVal(OptionsDict* dict, const ValueType& val) const;
+  int ValidateIntString(const std::string& val) const;
 
   int min_;
   int max_;
@@ -231,6 +210,24 @@ class BoolOption : public OptionsParser::Option {
   ValueType GetVal(const OptionsDict&) const;
   void SetVal(OptionsDict* dict, const ValueType& val) const;
   void ValidateBoolString(const std::string& val);
+};
+
+class ButtonOption : public OptionsParser::Option {
+ public:
+  using ValueType = Button;
+  ButtonOption(const OptionId& id);
+
+  void SetValue(const std::string& value, OptionsDict* dict) override;
+
+ private:
+  std::string GetOptionString(const OptionsDict& dict) const override;
+  bool ProcessLongFlag(const std::string& flag, const std::string& value,
+                       OptionsDict* dict) override;
+  std::string GetHelp(const OptionsDict& dict) const override;
+  bool ProcessShortFlag(char flag, OptionsDict* dict) override;
+
+  ValueType GetVal(OptionsDict*) const;
+  void SetVal(OptionsDict* dict, const ValueType& val) const;
 };
 
 class ChoiceOption : public OptionsParser::Option {
